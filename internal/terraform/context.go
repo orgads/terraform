@@ -149,6 +149,11 @@ func NewContext(opts *ContextOpts) (*Context, tfdiags.Diagnostics) {
 
 	plugins := newContextPlugins(opts.Providers, opts.Provisioners, opts.PreloadedProviderSchemas)
 
+	// Create the cancellation context at initialization time so that
+	// if Stop is called before any operation starts, subsequent operations
+	// can detect the cancellation and exit early.
+	runContext, runContextCancel := context.WithCancel(context.Background())
+
 	log.Printf("[TRACE] terraform.NewContext: complete")
 
 	return &Context{
@@ -162,6 +167,8 @@ func NewContext(opts *ContextOpts) (*Context, tfdiags.Diagnostics) {
 		parallelSem:         NewSemaphore(par),
 		providerInputConfig: make(map[string]map[string]cty.Value),
 		sh:                  sh,
+		runContext:          runContext,
+		runContextCancel:    runContextCancel,
 	}, diags
 }
 
@@ -202,17 +209,15 @@ func (c *Context) Stop() {
 	c.l.Lock()
 	defer c.l.Unlock()
 
-	// If we're running, then stop
-	if c.runContextCancel != nil {
-		log.Printf("[WARN] terraform: run context exists, stopping")
+	// Cancel the run context. This will affect both currently running
+	// operations and any operations that haven't started yet.
+	log.Printf("[WARN] terraform: cancelling run context")
 
-		// Tell the hook we want to stop
-		c.sh.Stop()
+	// Tell the hook we want to stop
+	c.sh.Stop()
 
-		// Stop the context
-		c.runContextCancel()
-		c.runContextCancel = nil
-	}
+	// Stop the context
+	c.runContextCancel()
 
 	// Notify all of the hooks that we're stopping, in case they want to try
 	// to flush in-memory state to disk before a subsequent hard kill.
@@ -240,11 +245,19 @@ func (c *Context) acquireRun(phase string) func() {
 		c.runCond.Wait()
 	}
 
+	// Check if the context is already cancelled (e.g., Stop was called before
+	// this operation started). If so, we should not proceed with the operation.
+	select {
+	case <-c.runContext.Done():
+		log.Printf("[WARN] terraform: run context already cancelled, aborting %s operation", phase)
+		// Return a no-op release function since we're not actually starting
+		return func() {}
+	default:
+		// Context is not cancelled, proceed normally
+	}
+
 	// Build our lock
 	c.runCond = sync.NewCond(&c.l)
-
-	// Create a new run context
-	c.runContext, c.runContextCancel = context.WithCancel(context.Background())
 
 	// Reset the stop hook so we're not stopped
 	c.sh.Reset()
@@ -257,19 +270,10 @@ func (c *Context) releaseRun() {
 	c.l.Lock()
 	defer c.l.Unlock()
 
-	// End our run. We check if runContext is non-nil because it can be
-	// set to nil if it was cancelled via Stop()
-	if c.runContextCancel != nil {
-		c.runContextCancel()
-	}
-
 	// Unlock all waiting our condition
 	cond := c.runCond
 	c.runCond = nil
 	cond.Broadcast()
-
-	// Unset the context
-	c.runContext = nil
 }
 
 // watchStop immediately returns a `stop` and a `wait` chan after dispatching
